@@ -1,0 +1,409 @@
+from __future__ import annotations
+
+import hashlib
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse
+from mysql.connector import errors, pooling
+
+app = FastAPI(title="Light Admin Panel", version="0.2.0")
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
+SESSION_COOKIE = "session_user"
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def load_env_file() -> None:
+    """Minimal .env parser to load DB settings without extra deps."""
+    if not ENV_PATH.exists():
+        return
+    for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+@lru_cache(maxsize=1)
+def db_config() -> Dict[str, object]:
+    load_env_file()
+    return {
+        "host": os.getenv("DB_HOST", "127.0.0.1"),
+        "user": os.getenv("DB_USER", "root"),
+        "password": os.getenv("DB_PASSWORD", ""),
+        "database": os.getenv("DB_NAME", "cloudauth"),
+        "port": int(os.getenv("DB_PORT", "3306")),
+    }
+
+
+@lru_cache(maxsize=1)
+def get_db_pool() -> pooling.MySQLConnectionPool:
+    cfg = db_config()
+    try:
+        return pooling.MySQLConnectionPool(pool_name="cloudauth_pool", pool_size=5, **cfg)
+    except errors.Error as exc:
+        raise RuntimeError(f"Database connection failed: {exc}") from exc
+
+
+def get_connection():
+    try:
+        return get_db_pool().get_connection()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="Database unavailable.") from exc
+
+
+def get_user(username: str) -> Optional[Dict[str, object]]:
+    conn = get_connection()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, username, password_hash, is_admin FROM users WHERE username=%s", (username,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def list_users() -> List[Dict[str, object]]:
+    conn = get_connection()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT username, is_admin, created_at FROM users ORDER BY created_at DESC")
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def admin_count() -> int:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users WHERE is_admin=1")
+        (count,) = cur.fetchone()
+        return int(count)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def create_user(username: str, password: str, is_admin: bool) -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO users (username, password_hash, is_admin) VALUES (%s, %s, %s)",
+            (username, hash_password(password), is_admin),
+        )
+        conn.commit()
+    except errors.IntegrityError as exc:
+        raise HTTPException(status_code=400, detail="User already exists.") from exc
+    except errors.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create user: {exc}") from exc
+    finally:
+        cur.close()
+        conn.close()
+
+
+def current_user(request: Request) -> Optional[Dict[str, object]]:
+    username = request.cookies.get(SESSION_COOKIE)
+    if not username:
+        return None
+    return get_user(username)
+
+
+def render_page(title: str, body: str, user: Optional[Dict[str, object]] = None) -> HTMLResponse:
+    navbar = f"""
+    <header class="nav">
+      <div class="logo">CloudAuth</div>
+      <nav>
+        <a href="/">Home</a>
+        {'<a href="/admin">Admin</a>' if user and user.get('is_admin') else ''}
+        {'<a href="/logout">Logout</a>' if user else '<a href="/login">Login</a>'}
+        {'<a class="ghost" href="/register">Create account</a>' if not user else ''}
+      </nav>
+    </header>
+    """
+    html = f"""
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8"/>
+      <meta name="viewport" content="width=device-width, initial-scale=1"/>
+      <title>{title}</title>
+      <style>
+        :root {{
+          --bg: #f7f8fb;
+          --card: #ffffff;
+          --text: #1d1f27;
+          --muted: #6b7280;
+          --primary: #2563eb;
+          --accent: #10b981;
+          --border: #e5e7eb;
+        }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+          font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+          background: radial-gradient(circle at 20% 20%, #eef2ff, #f7f8fb 35%), radial-gradient(circle at 80% 0%, #ecfdf3, #f7f8fb 40%), var(--bg);
+          color: var(--text);
+          min-height: 100vh;
+        }}
+        .nav {{
+          position: sticky;
+          top: 0;
+          backdrop-filter: blur(10px);
+          background: rgba(255,255,255,0.8);
+          border-bottom: 1px solid var(--border);
+          padding: 14px 28px;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 16px;
+        }}
+        .nav a {{
+          color: var(--text);
+          text-decoration: none;
+          margin-left: 14px;
+          font-weight: 600;
+          transition: color 0.15s ease, transform 0.15s ease;
+        }}
+        .nav a:hover {{ color: var(--primary); transform: translateY(-1px); }}
+        .nav .ghost {{
+          border: 1px solid var(--border);
+          padding: 6px 12px;
+          border-radius: 10px;
+          background: linear-gradient(120deg, rgba(37,99,235,0.08), rgba(16,185,129,0.08));
+        }}
+        .logo {{ font-weight: 800; letter-spacing: 0.5px; }}
+        .wrap {{
+          max-width: 960px;
+          margin: 0 auto;
+          padding: 32px 24px 48px;
+        }}
+        .card {{
+          background: var(--card);
+          border: 1px solid var(--border);
+          border-radius: 16px;
+          padding: 24px;
+          box-shadow: 0 15px 40px rgba(0,0,0,0.04);
+          margin-top: 18px;
+        }}
+        h1 {{ font-size: 28px; margin-bottom: 12px; }}
+        h2 {{ font-size: 22px; margin: 18px 0 8px; }}
+        p {{ color: var(--muted); line-height: 1.6; margin-bottom: 12px; }}
+        form {{
+          display: grid;
+          gap: 12px;
+          margin-top: 12px;
+        }}
+        label {{ font-weight: 600; color: var(--text); }}
+        input {{
+          padding: 12px;
+          border-radius: 12px;
+          border: 1px solid var(--border);
+          background: #f9fafb;
+          font-size: 15px;
+        }}
+        button {{
+          padding: 12px 16px;
+          border: none;
+          border-radius: 12px;
+          background: linear-gradient(120deg, var(--primary), #3b82f6);
+          color: white;
+          font-weight: 700;
+          cursor: pointer;
+          transition: transform 0.12s ease, box-shadow 0.12s ease;
+          box-shadow: 0 8px 20px rgba(37,99,235,0.22);
+        }}
+        button:hover {{ transform: translateY(-1px); box-shadow: 0 10px 24px rgba(37,99,235,0.25); }}
+        .pill {{
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          padding: 8px 12px;
+          border-radius: 999px;
+          background: rgba(16,185,129,0.12);
+          color: #065f46;
+          font-weight: 700;
+          font-size: 12px;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }}
+        .error {{
+          padding: 10px 12px;
+          border-radius: 12px;
+          background: rgba(239,68,68,0.08);
+          color: #b91c1c;
+          border: 1px solid rgba(248,113,113,0.5);
+        }}
+      </style>
+    </head>
+    <body>
+      {navbar}
+      <main class="wrap">
+        {body}
+      </main>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+@app.get("/", response_class=HTMLResponse)
+def landing(request: Request, user: Optional[Dict[str, object]] = Depends(current_user)) -> HTMLResponse:
+    hero = f"""
+    <section class="card">
+      <div class="pill">Light theme</div>
+      <h1>Welcome to your admin panel</h1>
+      <p>Manage users with a MariaDB backend. The first account becomes admin automatically.</p>
+      {"<p><strong>Signed in as:</strong> " + user["username"] + (" (admin)" if user.get("is_admin") else "") + "</p>" if user else "<p>Sign in or create an account to get started.</p>"}
+    </section>
+    """
+    if user and user.get("is_admin"):
+        hero += """
+        <section class="card">
+          <h2>Admin shortcuts</h2>
+          <p>Visit the admin panel to review accounts.</p>
+          <a href="/admin"><button>Open admin panel</button></a>
+        </section>
+        """
+    return render_page("Home", hero, user)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_view(request: Request, user: Optional[Dict[str, object]] = Depends(current_user), error: str = "") -> HTMLResponse:
+    if user:
+        return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    body = f"""
+    <section class="card">
+      <h1>Login</h1>
+      {'<div class="error">' + error + '</div>' if error else ''}
+      <form method="post" action="/login">
+        <div>
+          <label for="username">Username</label>
+          <input id="username" name="username" placeholder="jane" required />
+        </div>
+        <div>
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" placeholder="******" required />
+        </div>
+        <button type="submit">Sign in</button>
+      </form>
+    </section>
+    """
+    return render_page("Login", body, None)
+
+
+@app.post("/login")
+def login(username: str = Form(...), password: str = Form(...)) -> RedirectResponse:
+    user = get_user(username)
+    if not user or user["password_hash"] != hash_password(password):
+        return RedirectResponse("/login?error=Invalid%20credentials", status_code=status.HTTP_303_SEE_OTHER)
+    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    response.set_cookie(SESSION_COOKIE, username, httponly=True, samesite="lax")
+    return response
+
+
+@app.get("/register", response_class=HTMLResponse)
+def register_view(request: Request, user: Optional[Dict[str, object]] = Depends(current_user), error: str = "") -> HTMLResponse:
+    if user:
+        return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    body = f"""
+    <section class="card">
+      <h1>Create account</h1>
+      <p>The first user becomes an admin automatically.</p>
+      {'<div class="error">' + error + '</div>' if error else ''}
+      <form method="post" action="/register">
+        <div>
+          <label for="username">Username</label>
+          <input id="username" name="username" placeholder="jane" required />
+        </div>
+        <div>
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" placeholder="Choose a strong password" required />
+        </div>
+        <button type="submit">Create account</button>
+      </form>
+    </section>
+    """
+    return render_page("Register", body, None)
+
+
+@app.post("/register")
+def register(username: str = Form(...), password: str = Form(...)) -> RedirectResponse:
+    if get_user(username):
+        return RedirectResponse("/register?error=User%20already%20exists", status_code=status.HTTP_303_SEE_OTHER)
+
+    is_first_admin = admin_count() == 0
+    try:
+        create_user(username, password, is_first_admin)
+    except HTTPException as exc:
+        if exc.status_code == 400:
+            return RedirectResponse("/register?error=User%20already%20exists", status_code=status.HTTP_303_SEE_OTHER)
+        raise
+
+    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    response.set_cookie(SESSION_COOKIE, username, httponly=True, samesite="lax")
+    return response
+
+
+@app.get("/logout")
+def logout() -> RedirectResponse:
+    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    response.delete_cookie(SESSION_COOKIE)
+    return response
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_panel(request: Request, user: Optional[Dict[str, object]] = Depends(current_user)) -> HTMLResponse:
+    if not user:
+        return RedirectResponse("/login?error=Login%20required", status_code=status.HTTP_303_SEE_OTHER)
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admins only")
+
+    users = list_users()
+    user_cards = "".join(
+        f"""
+        <div class="card">
+          <h2>{u['username']}</h2>
+          <p>Status: {"Admin" if u.get("is_admin") else "User"}</p>
+          <p>Created: {u.get("created_at")}</p>
+        </div>
+        """
+        for u in users
+    )
+    body = f"""
+    <section class="card">
+      <div class="pill">Admin</div>
+      <h1>Admin panel</h1>
+      <p>Review who has access. Backed by MariaDB database <code>{db_config().get("database")}</code>.</p>
+    </section>
+    {user_cards if user_cards else "<p>No users yet.</p>"}
+    """
+    return render_page("Admin", body, user)
+
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        conn.close()
+        return {"status": "ok", "db": "ok"}
+    except Exception:  # noqa: BLE001
+        return {"status": "degraded", "db": "error"}
+
+
+# For local development: run via run.cmd or uvicorn main:app --reload --app-dir webapp
