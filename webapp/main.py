@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -85,6 +86,17 @@ def list_users() -> List[Dict[str, object]]:
         conn.close()
 
 
+def list_users_with_ids() -> List[Dict[str, object]]:
+    conn = get_connection()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, username, is_admin, created_at FROM users ORDER BY id DESC")
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+
 def admin_count() -> int:
     conn = get_connection()
     try:
@@ -141,12 +153,62 @@ def list_login_events(limit: int = 50) -> List[Dict[str, object]]:
     try:
         cur = conn.cursor(dictionary=True)
         cur.execute(
-            "SELECT username, logged_in_at FROM login_events ORDER BY logged_in_at DESC LIMIT %s",
+            "SELECT id, username, logged_in_at FROM login_events ORDER BY logged_in_at DESC LIMIT %s",
             (int(limit),),
         )
         return [dict(row) for row in cur.fetchall()]
     except errors.Error as exc:
         raise HTTPException(status_code=500, detail=f"Failed to read login history: {exc}") from exc
+    finally:
+        cur.close()
+        conn.close()
+
+
+def list_login_events_admin(limit: int = 200) -> List[Dict[str, object]]:
+    return list_login_events(limit=limit)
+
+
+def parse_timestamp(value: str) -> str:
+    cleaned = value.strip()
+    cleaned = cleaned.replace("T", " ")
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid timestamp format.") from exc
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def update_login_event(event_id: int, username: str, logged_in_at: str) -> None:
+    ensure_login_events_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM login_events WHERE id=%s", (event_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Login event not found.")
+        cur.execute(
+            "UPDATE login_events SET username=%s, logged_in_at=%s WHERE id=%s",
+            (username, parse_timestamp(logged_in_at), event_id),
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+    except errors.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update login event: {exc}") from exc
+    finally:
+        cur.close()
+        conn.close()
+
+
+def delete_login_event(event_id: int) -> None:
+    ensure_login_events_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM login_events WHERE id=%s", (event_id,))
+        conn.commit()
+    except errors.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete login event: {exc}") from exc
     finally:
         cur.close()
         conn.close()
@@ -197,6 +259,45 @@ def set_admin_flag(username: str, is_admin: bool) -> None:
         raise
     except errors.Error as exc:
         raise HTTPException(status_code=500, detail=f"Failed to update admin flag: {exc}") from exc
+    finally:
+        cur.close()
+        conn.close()
+
+
+def update_user_record(user_id: int, username: str, is_admin: bool, new_password: Optional[str]) -> None:
+    """Admin-only edit of user fields with guardrails."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, username, is_admin FROM users WHERE id=%s", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found.")
+
+        current_admin = bool(row["is_admin"])
+        if current_admin and not is_admin:
+            cur.execute("SELECT COUNT(*) FROM users WHERE is_admin=1")
+            (admin_total,) = cur.fetchone()
+            if int(admin_total) <= 1:
+                raise HTTPException(status_code=400, detail="Cannot remove the last admin.")
+
+        params = [username, int(is_admin)]
+        set_clauses = ["username=%s", "is_admin=%s"]
+
+        if new_password:
+            params.append(hash_password(new_password))
+            set_clauses.append("password_hash=%s")
+
+        params.append(user_id)
+        sql = f"UPDATE users SET {', '.join(set_clauses)} WHERE id=%s"
+        cur.execute(sql, tuple(params))
+        conn.commit()
+    except HTTPException:
+        raise
+    except errors.IntegrityError as exc:
+        raise HTTPException(status_code=400, detail="Username already exists.") from exc
+    except errors.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update user: {exc}") from exc
     finally:
         cur.close()
         conn.close()
@@ -294,8 +395,8 @@ def render_page(title: str, body: str, user: Optional[Dict[str, object]] = None)
           gap: 12px;
           margin-top: 12px;
         }}
-        label {{ font-weight: 600; color: var(--text); }}
-        input {{
+        label {{ font-weight: 600; color: var(--text); display: block; margin-bottom: 6px; }}
+        input, select {{
           padding: 12px;
           border-radius: 12px;
           border: 1px solid var(--border);
@@ -362,6 +463,36 @@ def render_page(title: str, body: str, user: Optional[Dict[str, object]] = None)
           border-radius: 12px;
           border: 1px solid var(--border);
           background: #f9fafb;
+        }}
+        .table {{
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+        }}
+        .table-row {{
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+          gap: 12px;
+          align-items: end;
+          padding: 12px;
+          border-radius: 14px;
+          border: 1px solid var(--border);
+          background: #f9fafb;
+        }}
+        .row-actions {{
+          display: flex;
+          gap: 8px;
+          align-items: center;
+        }}
+        .ghost-btn {{
+          background: transparent;
+          color: var(--text);
+          border: 1px dashed var(--border);
+          box-shadow: none;
+        }}
+        .danger {{
+          background: linear-gradient(120deg, #ef4444, #dc2626);
+          box-shadow: 0 8px 20px rgba(239,68,68,0.2);
         }}
         .muted {{ color: var(--muted); }}
       </style>
@@ -548,11 +679,115 @@ def admin_panel(
       <div class="pill">Admin</div>
       <h1>Admin panel</h1>
       <p>Review who has access. Backed by MariaDB database <code>{db_config().get("database")}</code>.</p>
+      <div class="user-actions">
+        <a href="/admin/editor"><button class="ghost-btn">Open table editor</button></a>
+      </div>
       {alerts}
     </section>
     {user_cards if user_cards else "<p>No users yet.</p>"}
     """
     return render_page("Admin", body, user)
+
+
+@app.get("/admin/editor", response_class=HTMLResponse)
+def table_editor(
+    request: Request,
+    user: Optional[Dict[str, object]] = Depends(current_user),
+    error: str = "",
+    success: str = "",
+) -> HTMLResponse:
+    if not user:
+        return RedirectResponse("/login?error=Login%20required", status_code=status.HTTP_303_SEE_OTHER)
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admins only")
+
+    users = list_users_with_ids()
+    events = list_login_events_admin()
+
+    alerts = ""
+    if error:
+        alerts += f'<div class="error">{error}</div>'
+    if success:
+        alerts += f'<div class="success">{success}</div>'
+
+    user_rows = "".join(
+        f"""
+        <form class="table-row" method="post" action="/admin/editor/users/update">
+          <input type="hidden" name="user_id" value="{u['id']}"/>
+          <div>
+            <label>Username</label>
+            <input name="username" value="{u['username']}" required />
+          </div>
+          <div>
+            <label>Role</label>
+            <select name="is_admin">
+              <option value="1" {"selected" if u["is_admin"] else ""}>Admin</option>
+              <option value="0" {"selected" if not u["is_admin"] else ""}>User</option>
+            </select>
+          </div>
+          <div>
+            <label>New password</label>
+            <input name="new_password" placeholder="Leave blank to keep" />
+          </div>
+          <div class="row-actions">
+            <button type="submit">Save</button>
+          </div>
+        </form>
+        """
+        for u in users
+    )
+
+    def format_ts(ts_value: object) -> str:
+        if hasattr(ts_value, "strftime"):
+            return ts_value.strftime("%Y-%m-%dT%H:%M:%S")
+        return str(ts_value).replace(" ", "T")
+
+    event_rows = "".join(
+        f"""
+        <form class="table-row" method="post" action="/admin/editor/login/update">
+          <input type="hidden" name="event_id" value="{e['id']}"/>
+          <div>
+            <label>User</label>
+            <input name="username" value="{e['username']}" required />
+          </div>
+          <div>
+            <label>Logged in at</label>
+            <input type="datetime-local" name="logged_in_at" value="{format_ts(e['logged_in_at'])}" required />
+          </div>
+          <div class="row-actions">
+            <button type="submit">Save</button>
+            <button type="submit" class="ghost-btn danger" formaction="/admin/editor/login/delete" formnovalidate>Delete</button>
+          </div>
+        </form>
+        """
+        for e in events
+    )
+
+    body = f"""
+    <section class="card">
+      <div class="pill">Admin</div>
+      <h1>Table editor</h1>
+      <p>Directly view and edit database rows for users and login events. Admins only.</p>
+      {alerts}
+    </section>
+
+    <section class="card">
+      <h2>Users</h2>
+      <p class="muted">Edit username, admin flag, or set a new password (leave blank to keep).</p>
+      <div class="table">
+        {user_rows if user_rows else "<p class='muted'>No users found.</p>"}
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Login events</h2>
+      <p class="muted">Adjust or remove login records. Time uses your local timezone.</p>
+      <div class="table">
+        {event_rows if event_rows else "<p class='muted'>No login events found.</p>"}
+      </div>
+    </section>
+    """
+    return render_page("Table editor", body, user)
 
 
 @app.post("/admin/role")
@@ -573,6 +808,59 @@ def update_admin_role(
         return RedirectResponse(f"/admin?error={quote(err)}", status_code=status.HTTP_303_SEE_OTHER)
 
     return RedirectResponse(f"/admin?success={quote(f'Updated admin access for {username}.')}", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/editor/users/update")
+def admin_edit_user(
+    user_id: int = Form(...),
+    username: str = Form(...),
+    is_admin: int = Form(...),
+    new_password: str = Form(""),
+    user: Optional[Dict[str, object]] = Depends(current_user),
+) -> RedirectResponse:
+    if not user:
+        return RedirectResponse("/login?error=Login%20required", status_code=status.HTTP_303_SEE_OTHER)
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admins only")
+    try:
+        update_user_record(user_id, username, bool(int(is_admin)), new_password.strip() or None)
+    except HTTPException as exc:
+        return RedirectResponse(f"/admin/editor?error={quote(str(exc.detail))}", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/editor?success=User%20updated", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/editor/login/update")
+def admin_edit_login_event(
+    event_id: int = Form(...),
+    username: str = Form(...),
+    logged_in_at: str = Form(...),
+    user: Optional[Dict[str, object]] = Depends(current_user),
+) -> RedirectResponse:
+    if not user:
+        return RedirectResponse("/login?error=Login%20required", status_code=status.HTTP_303_SEE_OTHER)
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admins only")
+    try:
+        update_login_event(event_id, username, logged_in_at)
+    except HTTPException as exc:
+        return RedirectResponse(f"/admin/editor?error={quote(str(exc.detail))}", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/editor?success=Login%20event%20updated", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.post("/admin/editor/login/delete")
+def admin_delete_login_event(
+    event_id: int = Form(...),
+    user: Optional[Dict[str, object]] = Depends(current_user),
+) -> RedirectResponse:
+    if not user:
+        return RedirectResponse("/login?error=Login%20required", status_code=status.HTTP_303_SEE_OTHER)
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admins only")
+    try:
+        delete_login_event(event_id)
+    except HTTPException as exc:
+        return RedirectResponse(f"/admin/editor?error={quote(str(exc.detail))}", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse("/admin/editor?success=Login%20event%20deleted", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/health")
