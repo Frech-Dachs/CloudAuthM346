@@ -14,10 +14,10 @@ REM Activate venv
 call ".venv\\Scripts\\activate"
 
 REM Install dependencies
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 REM Launch FastAPI app with uvicorn (app lives in this directory)
-python -m uvicorn main:app --reload
+python -m uvicorn main:app --reload --port 80 --host 0.0.0.0
 
 popd
 endlocal
