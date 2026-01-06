@@ -5,6 +5,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -96,6 +97,61 @@ def admin_count() -> int:
         conn.close()
 
 
+@lru_cache(maxsize=1)
+def ensure_login_events_table() -> None:
+    """Create the login_events table once at runtime if it is missing."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS login_events (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              username VARCHAR(100) NOT NULL,
+              logged_in_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              INDEX idx_login_events_logged_in_at (logged_in_at)
+            )
+            """
+        )
+        conn.commit()
+    except errors.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize login history: {exc}") from exc
+    finally:
+        cur.close()
+        conn.close()
+
+
+def record_login_event(username: str) -> None:
+    ensure_login_events_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO login_events (username) VALUES (%s)", (username,))
+        conn.commit()
+    except errors.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to record login event: {exc}") from exc
+    finally:
+        cur.close()
+        conn.close()
+
+
+def list_login_events(limit: int = 50) -> List[Dict[str, object]]:
+    ensure_login_events_table()
+    conn = get_connection()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT username, logged_in_at FROM login_events ORDER BY logged_in_at DESC LIMIT %s",
+            (int(limit),),
+        )
+        return [dict(row) for row in cur.fetchall()]
+    except errors.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read login history: {exc}") from exc
+    finally:
+        cur.close()
+        conn.close()
+
+
 def create_user(username: str, password: str, is_admin: bool) -> None:
     conn = get_connection()
     try:
@@ -114,6 +170,38 @@ def create_user(username: str, password: str, is_admin: bool) -> None:
         conn.close()
 
 
+def set_admin_flag(username: str, is_admin: bool) -> None:
+    """Update a user's admin flag with guardrails to avoid losing all admins."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT is_admin FROM users WHERE username=%s", (username,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found.")
+
+        current_admin = bool(row[0])
+        # Do not remove the last remaining admin account.
+        if current_admin and not is_admin:
+            cur.execute("SELECT COUNT(*) FROM users WHERE is_admin=1")
+            (admin_total,) = cur.fetchone()
+            if int(admin_total) <= 1:
+                raise HTTPException(status_code=400, detail="Cannot remove the last admin.")
+
+        if current_admin == is_admin:
+            return
+
+        cur.execute("UPDATE users SET is_admin=%s WHERE username=%s", (is_admin, username))
+        conn.commit()
+    except HTTPException:
+        raise
+    except errors.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to update admin flag: {exc}") from exc
+    finally:
+        cur.close()
+        conn.close()
+
+
 def current_user(request: Request) -> Optional[Dict[str, object]]:
     username = request.cookies.get(SESSION_COOKIE)
     if not username:
@@ -127,6 +215,7 @@ def render_page(title: str, body: str, user: Optional[Dict[str, object]] = None)
       <div class="logo">CloudAuth</div>
       <nav>
         <a href="/">Home</a>
+        <a href="/logins">Login history</a>
         {'<a href="/admin">Admin</a>' if user and user.get('is_admin') else ''}
         {'<a href="/logout">Logout</a>' if user else '<a href="/login">Login</a>'}
         {'<a class="ghost" href="/register">Create account</a>' if not user else ''}
@@ -245,6 +334,36 @@ def render_page(title: str, body: str, user: Optional[Dict[str, object]] = None)
           color: #b91c1c;
           border: 1px solid rgba(248,113,113,0.5);
         }}
+        .success {{
+          padding: 10px 12px;
+          border-radius: 12px;
+          background: rgba(16,185,129,0.1);
+          color: #065f46;
+          border: 1px solid rgba(16,185,129,0.4);
+        }}
+        .user-actions {{
+          margin-top: 12px;
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          align-items: center;
+        }}
+        .login-list {{
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          margin-top: 12px;
+        }}
+        .login-row {{
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: 12px;
+          border-radius: 12px;
+          border: 1px solid var(--border);
+          background: #f9fafb;
+        }}
+        .muted {{ color: var(--muted); }}
       </style>
     </head>
     <body>
@@ -279,6 +398,33 @@ def landing(request: Request, user: Optional[Dict[str, object]] = Depends(curren
     return render_page("Home", hero, user)
 
 
+@app.get("/logins", response_class=HTMLResponse)
+def login_history(request: Request, user: Optional[Dict[str, object]] = Depends(current_user)) -> HTMLResponse:
+    events = list_login_events()
+    event_items = "".join(
+        f"""
+        <div class="login-row">
+          <div>
+            <strong>{e["username"]}</strong>
+            <div class="muted">Signed in at {e["logged_in_at"]}</div>
+          </div>
+        </div>
+        """
+        for e in events
+    )
+    body = f"""
+    <section class="card">
+      <div class="pill">Audit</div>
+      <h1>Recent logins</h1>
+      <p>Latest successful logins across all users (most recent first).</p>
+      <div class="login-list">
+        {event_items if event_items else "<p class='muted'>No logins recorded yet.</p>"}
+      </div>
+    </section>
+    """
+    return render_page("Login history", body, user)
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_view(request: Request, user: Optional[Dict[str, object]] = Depends(current_user), error: str = "") -> HTMLResponse:
     if user:
@@ -308,6 +454,7 @@ def login(username: str = Form(...), password: str = Form(...)) -> RedirectRespo
     user = get_user(username)
     if not user or user["password_hash"] != hash_password(password):
         return RedirectResponse("/login?error=Invalid%20credentials", status_code=status.HTTP_303_SEE_OTHER)
+    record_login_event(username)
     response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(SESSION_COOKIE, username, httponly=True, samesite="lax")
     return response
@@ -364,19 +511,34 @@ def logout() -> RedirectResponse:
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_panel(request: Request, user: Optional[Dict[str, object]] = Depends(current_user)) -> HTMLResponse:
+def admin_panel(
+    request: Request,
+    user: Optional[Dict[str, object]] = Depends(current_user),
+    error: str = "",
+    success: str = "",
+) -> HTMLResponse:
     if not user:
         return RedirectResponse("/login?error=Login%20required", status_code=status.HTTP_303_SEE_OTHER)
     if not user.get("is_admin"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admins only")
 
     users = list_users()
+    alerts = ""
+    if error:
+        alerts += f'<div class="error">{error}</div>'
+    if success:
+        alerts += f'<div class="success">{success}</div>'
     user_cards = "".join(
         f"""
         <div class="card">
           <h2>{u['username']}</h2>
           <p>Status: {"Admin" if u.get("is_admin") else "User"}</p>
           <p>Created: {u.get("created_at")}</p>
+          <form class="user-actions" method="post" action="/admin/role">
+            <input type="hidden" name="username" value="{u['username']}"/>
+            <input type="hidden" name="is_admin" value="{0 if u.get("is_admin") else 1}"/>
+            <button type="submit">{'Remove admin' if u.get('is_admin') else 'Make admin'}</button>
+          </form>
         </div>
         """
         for u in users
@@ -386,10 +548,31 @@ def admin_panel(request: Request, user: Optional[Dict[str, object]] = Depends(cu
       <div class="pill">Admin</div>
       <h1>Admin panel</h1>
       <p>Review who has access. Backed by MariaDB database <code>{db_config().get("database")}</code>.</p>
+      {alerts}
     </section>
     {user_cards if user_cards else "<p>No users yet.</p>"}
     """
     return render_page("Admin", body, user)
+
+
+@app.post("/admin/role")
+def update_admin_role(
+    username: str = Form(...),
+    is_admin: int = Form(...),
+    user: Optional[Dict[str, object]] = Depends(current_user),
+) -> RedirectResponse:
+    if not user:
+        return RedirectResponse("/login?error=Login%20required", status_code=status.HTTP_303_SEE_OTHER)
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admins only")
+
+    try:
+        set_admin_flag(username, bool(int(is_admin)))
+    except HTTPException as exc:
+        err = str(exc.detail)
+        return RedirectResponse(f"/admin?error={quote(err)}", status_code=status.HTTP_303_SEE_OTHER)
+
+    return RedirectResponse(f"/admin?success={quote(f'Updated admin access for {username}.')}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/health")
